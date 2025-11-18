@@ -243,6 +243,7 @@
     }
     catch {
         Write-Host "[FATAL] Failed to bind IPv4 loopback on port $ListenPort : $($_.Exception.Message)"
+		$ipv4 = $null
     }
 
     try {
@@ -251,10 +252,12 @@
     }
     catch {
         Write-Host "[WARN] Failed to bind IPv6 loopback on port $ListenPort : $($_.Exception.Message)"
+		$ipv6 = $null
     }
 
     if (-not $ipv4 -and -not $ipv6) {
         Write-Host "[FATAL] No listeners started. Exiting."
+		try { if ($pool) { $pool.Close(); $pool.Dispose() } } catch {}
         return
     }
 
@@ -264,33 +267,43 @@
 
     Write-Host "[INFO] Press Ctrl+C to stop."
 
-    # Accept loop
-    while ($true) {
-        foreach ($listener in @($ipv4, $ipv6)) {
-            if (-not $listener) { continue }
+    try{
+		# Accept loop
+		while ($true) {
+			foreach ($listener in @($ipv4, $ipv6)) {
+				if (-not $listener) { continue }
 
-            # drain all pending connections for this listener before sleeping
-            while ($listener.Pending()) {
-                try {
-                    $client = $listener.AcceptTcpClient()
-                }
-                catch {
-                    Write-Host "[WARN] Accept failed: $($_.Exception.Message)"
-                    break
-                }
+				# drain all pending connections for this listener before sleeping
+				while ($listener.Pending()) {
+					try {
+						$client = $listener.AcceptTcpClient()
+					}
+					catch {
+						Write-Host "[WARN] Accept failed: $($_.Exception.Message)"
+						break
+					}
 
-                # Spawn client handler in the runspace pool
-                $ps = [PowerShell]::Create()
-                $ps.RunspacePool = $pool
-                $null = $ps.AddCommand('Handle-Client').
-                             AddParameter('Client', $client).
-                             AddParameter('BufferSize', $BufferSize)
+					# Spawn client handler in the runspace pool
+					$ps = [PowerShell]::Create()
+					$ps.RunspacePool = $pool
+					$null = $ps.AddCommand('Handle-Client').
+								 AddParameter('Client', $client).
+								 AddParameter('BufferSize', $BufferSize)
 
-                # fire and forget
-                $null = $ps.BeginInvoke()
-            }
-        }
-        Start-Sleep -Milliseconds 5
-    }
+					# fire and forget
+					$null = $ps.BeginInvoke()
+				}
+			}
+			Start-Sleep -Milliseconds 5
+		}
+	}
+	
+	finally {
+		Write-Host "[INFO] Stopping listeners..."
+		try { if ($ipv4) { $ipv4.Stop() } } catch {}
+		try { if ($ipv6) { $ipv6.Stop() } } catch {}
+		try { if ($pool) { $pool.Close(); $pool.Dispose() } } catch {}
+		Write-Host "[INFO] Stopped."
+	}
 }
  

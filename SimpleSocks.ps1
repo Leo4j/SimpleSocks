@@ -1,4 +1,4 @@
- function SimpleSocks{
+function SimpleSocks{
     param(
         [int]$ListenPort = 1080,
         [int]$BufferSize = 32768,
@@ -307,3 +307,4 @@
 	}
 }
  
+

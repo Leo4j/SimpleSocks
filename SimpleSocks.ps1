@@ -2,7 +2,9 @@ function SimpleSocks{
     param(
         [int]$ListenPort = 1080,
         [int]$BufferSize = 32768,
-        [int]$MaxConcurrent = 256
+        [int]$MaxConcurrent = 256,
+        [int]$ConnectTimeoutMs = 3000,
+        [switch]$Quiet
     )
 
     function Read-Exact {
@@ -66,42 +68,30 @@ function SimpleSocks{
         $buffer = New-Object byte[] $BufferSize
 
         try {
-            while ($socketA -and $socketB -and ($socketA.Connected -or $socketB.Connected)) {
+            while ($socketA -and $socketB) {
                 # Build list of sockets to poll
-                $readList = New-Object 'System.Collections.Generic.List[System.Net.Sockets.Socket]'
-                if ($socketA.Connected) { [void]$readList.Add($socketA) }
-                if ($socketB.Connected) { [void]$readList.Add($socketB) }
-
-                if ($readList.Count -eq 0) { break }
-
                 $r = New-Object System.Collections.ArrayList
-                foreach ($s in $readList) { [void]$r.Add($s) }
+                [void]$r.Add($socketA)
+                [void]$r.Add($socketB)
 
                 # Wait up to 1s for activity
                 [System.Net.Sockets.Socket]::Select($r, $null, $null, 1000000)
 
+                if ($r.Count -eq 0) { continue }   # idle tick, loop again
+
                 foreach ($s in $r) {
                     if ($s -eq $socketA) {
                         $read = $socketA.Receive($buffer)
-                        if ($read -le 0) {
-                            try { $socketA.Shutdown([System.Net.Sockets.SocketShutdown]::Both) } catch {}
-                            try { $socketA.Close() } catch {}
-                        } else {
-                            try {
-                                [void]$socketB.Send($buffer, 0, $read, [System.Net.Sockets.SocketFlags]::None)
-                            } catch {}
-                        }
+                        # EOF on EITHER side -> tear the whole relay down (the caller's finally
+                        # closes both). Keeping the other half-open here would spin this runspace
+                        # on liveness probes (client closes immediately, target stays up).
+                        if ($read -le 0) { return }
+                        try { [void]$socketB.Send($buffer, 0, $read, [System.Net.Sockets.SocketFlags]::None) } catch { return }
                     }
                     elseif ($s -eq $socketB) {
                         $read = $socketB.Receive($buffer)
-                        if ($read -le 0) {
-                            try { $socketB.Shutdown([System.Net.Sockets.SocketShutdown]::Both) } catch {}
-                            try { $socketB.Close() } catch {}
-                        } else {
-                            try {
-                                [void]$socketA.Send($buffer, 0, $read, [System.Net.Sockets.SocketFlags]::None)
-                            } catch {}
-                        }
+                        if ($read -le 0) { return }
+                        try { [void]$socketA.Send($buffer, 0, $read, [System.Net.Sockets.SocketFlags]::None) } catch { return }
                     }
                 }
             }
@@ -117,7 +107,11 @@ function SimpleSocks{
             [System.Net.Sockets.TcpClient]$Client,
 
             [Parameter(Mandatory=$true)]
-            [int]$BufferSize
+            [int]$BufferSize,
+
+            [int]$ConnectTimeoutMs = 3000,
+
+            [switch]$Quiet
         )
 
         $stream       = $null
@@ -127,7 +121,7 @@ function SimpleSocks{
         try {
             $Client.NoDelay = $true
             $stream = $Client.GetStream()
-            Write-Host "[*] New client: $($Client.Client.RemoteEndPoint)"
+            if (-not $Quiet) { Write-Host "[*] New client: $($Client.Client.RemoteEndPoint)" }
 
             # ---------- GREETING ----------
             $greeting = New-Object byte[] 3
@@ -190,18 +184,54 @@ function SimpleSocks{
             }
             $port = ($p1 -shl 8) -bor $p2
 
-            Write-Host "[>] CONNECT $dest : $port"
+            if (-not $Quiet) { Write-Host "[>] CONNECT $dest : $port" }
 
-            # ---------- TARGET CONNECT ----------
+            # ---------- TARGET CONNECT (bounded) ----------
+            # Bound the upstream connect so a dead/unreachable target cannot pin this runspace
+            # for the OS default (~21s). Under a large liveness sweep that blocking connect
+            # exhausts the pool, which makes the proxy stop answering new SOCKS requests -
+            # surfacing on the client as "Reading proxy reply timed out" / "Proxy closed the
+            # connection unexpectedly", and as false-dead hosts.
             $target = New-Object System.Net.Sockets.TcpClient
             $target.NoDelay = $true
-            $target.Connect($dest, $port)
+            $connectErr = $null
+            try {
+                $ar = $target.BeginConnect($dest, $port, $null, $null)
+                if ($ar.AsyncWaitHandle.WaitOne($ConnectTimeoutMs)) {
+                    # Must call EndConnect to COMPLETE the socket; .Connected stays false until it runs,
+                    # and EndConnect throws the real SocketException (refused/unreachable) on failure.
+                    $target.EndConnect($ar)
+                } else {
+                    $connectErr = 'timeout'
+                }
+            } catch {
+                $connectErr = $_.Exception
+            }
+            if (-not $connectErr -and -not $target.Connected) { $connectErr = 'timeout' }
+
+            if ($connectErr) {
+                # Reply with a proper SOCKS5 failure so the client sees a clean host-unreachable /
+                # refused instead of an abruptly dropped connection, then close. REP codes:
+                # 0x01 general, 0x03 network unreachable, 0x04 host unreachable, 0x05 refused.
+                $rep = 4
+                if ($connectErr -is [System.Net.Sockets.SocketException]) {
+                    $code = ([System.Net.Sockets.SocketException]$connectErr).SocketErrorCode
+                    if     ($code -eq [System.Net.Sockets.SocketError]::ConnectionRefused)  { $rep = 5 }
+                    elseif ($code -eq [System.Net.Sockets.SocketError]::NetworkUnreachable) { $rep = 3 }
+                    elseif ($code -eq [System.Net.Sockets.SocketError]::HostUnreachable)    { $rep = 4 }
+                    else { $rep = 1 }
+                }
+                try { $fail = [byte[]](5,$rep,0,1,0,0,0,0,0,0); $stream.Write($fail,0,$fail.Length); $stream.Flush() } catch {}
+                try { $target.Close() } catch {}
+                return
+            }
+
             $targetStream = $target.GetStream()
 
             # ---------- SUCCESS REPLY ----------
             $success = [byte[]](5,0,0,1,0,0,0,0,0,0)
             $stream.Write($success, 0, $success.Length)
-            Write-Host "[+] Relaying..."
+            if (-not $Quiet) { Write-Host "[+] Relaying..." }
 
             # ---------- RELAY ----------
             Relay-Sockets -Client $Client -Target $target -BufferSize $BufferSize
@@ -209,7 +239,13 @@ function SimpleSocks{
             #Write-Host "[*] Relay complete"
         }
         catch {
-            Write-Host "[ERR] $($_.Exception.Message)"
+            $__m = $_.Exception.Message
+            # Benign: a client (e.g. Proxifier) opened then aborted before completing the SOCKS
+            # handshake - common with liveness probes that close as soon as the TCP connect
+            # succeeds. Don't log these as errors; the finally block still cleans up.
+            if ($__m -ne 'Stream closed unexpectedly' -and $__m -ne 'Stream closed') {
+                Write-Host "[ERR] $__m"
+            }
         }
         finally {
             try { if ($targetStream) { $targetStream.Close() } } catch {}
@@ -243,7 +279,7 @@ function SimpleSocks{
     }
     catch {
         Write-Host "[FATAL] Failed to bind IPv4 loopback on port $ListenPort : $($_.Exception.Message)"
-		$ipv4 = $null
+        $ipv4 = $null
     }
 
     try {
@@ -252,59 +288,74 @@ function SimpleSocks{
     }
     catch {
         Write-Host "[WARN] Failed to bind IPv6 loopback on port $ListenPort : $($_.Exception.Message)"
-		$ipv6 = $null
+        $ipv6 = $null
     }
 
     if (-not $ipv4 -and -not $ipv6) {
         Write-Host "[FATAL] No listeners started. Exiting."
-		try { if ($pool) { $pool.Close(); $pool.Dispose() } } catch {}
+        try { if ($pool) { $pool.Close(); $pool.Dispose() } } catch {}
         return
     }
 
     Write-Host "[INFO] Listening on:"
     if ($ipv4) { Write-Host "    127.0.0.1:$ListenPort" }
     if ($ipv6) { Write-Host "    [::1]:$ListenPort" }
-
+    Write-Host "[INFO] ConnectTimeout=${ConnectTimeoutMs}ms  MaxConcurrent=$MaxConcurrent  Quiet=$([bool]$Quiet)"
     Write-Host "[INFO] Press Ctrl+C to stop."
 
+    $inflight = New-Object System.Collections.ArrayList
     try{
-		# Accept loop
-		while ($true) {
-			foreach ($listener in @($ipv4, $ipv6)) {
-				if (-not $listener) { continue }
+        # Accept loop
+        while ($true) {
+            foreach ($listener in @($ipv4, $ipv6)) {
+                if (-not $listener) { continue }
 
-				# drain all pending connections for this listener before sleeping
-				while ($listener.Pending()) {
-					try {
-						$client = $listener.AcceptTcpClient()
-					}
-					catch {
-						Write-Host "[WARN] Accept failed: $($_.Exception.Message)"
-						break
-					}
+                # drain all pending connections for this listener before sleeping
+                while ($listener.Pending()) {
+                    try {
+                        $client = $listener.AcceptTcpClient()
+                    }
+                    catch {
+                        Write-Host "[WARN] Accept failed: $($_.Exception.Message)"
+                        break
+                    }
 
-					# Spawn client handler in the runspace pool
-					$ps = [PowerShell]::Create()
-					$ps.RunspacePool = $pool
-					$null = $ps.AddCommand('Handle-Client').
-								 AddParameter('Client', $client).
-								 AddParameter('BufferSize', $BufferSize)
+                    # Spawn client handler in the runspace pool
+                    $ps = [PowerShell]::Create()
+                    $ps.RunspacePool = $pool
+                    $null = $ps.AddCommand('Handle-Client').
+                                 AddParameter('Client', $client).
+                                 AddParameter('BufferSize', $BufferSize).
+                                 AddParameter('ConnectTimeoutMs', $ConnectTimeoutMs).
+                                 AddParameter('Quiet', [bool]$Quiet)
 
-					# fire and forget
-					$null = $ps.BeginInvoke()
-				}
-			}
-			Start-Sleep -Milliseconds 5
-		}
-	}
-	
-	finally {
-		Write-Host "[INFO] Stopping listeners..."
-		try { if ($ipv4) { $ipv4.Stop() } } catch {}
-		try { if ($ipv6) { $ipv6.Stop() } } catch {}
-		try { if ($pool) { $pool.Close(); $pool.Dispose() } } catch {}
-		Write-Host "[INFO] Stopped."
-	}
+                    # fire and forget, but keep the handle so we can reap it
+                    $h = $ps.BeginInvoke()
+                    [void]$inflight.Add([PSCustomObject]@{ PS = $ps; Handle = $h })
+                }
+            }
+
+            # Reap finished handlers so PowerShell instances/handles don't accumulate over a
+            # long run (thousands of liveness probes) - a slow leak that can make the proxy
+            # degrade or "get stuck".
+            if ($inflight.Count -gt 0) {
+                $done = @($inflight | Where-Object { $_.Handle.IsCompleted })
+                foreach ($d in $done) {
+                    try { [void]$d.PS.EndInvoke($d.Handle) } catch {}
+                    try { $d.PS.Dispose() } catch {}
+                    [void]$inflight.Remove($d)
+                }
+            }
+
+            Start-Sleep -Milliseconds 5
+        }
+    }
+
+    finally {
+        Write-Host "[INFO] Stopping listeners..."
+        try { if ($ipv4) { $ipv4.Stop() } } catch {}
+        try { if ($ipv6) { $ipv6.Stop() } } catch {}
+        try { if ($pool) { $pool.Close(); $pool.Dispose() } } catch {}
+        Write-Host "[INFO] Stopped."
+    }
 }
- 
-
